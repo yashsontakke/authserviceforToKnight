@@ -3,92 +3,115 @@ package com.example.demo.controller;
 
 import java.io.IOException;
 import java.security.GeneralSecurityException;
+import java.time.Duration; // For Max-Age
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value; // Import Value
+import org.springframework.http.HttpHeaders; // Import HttpHeaders
 import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseCookie; // Import ResponseCookie
 import org.springframework.http.ResponseEntity;
 import org.springframework.util.StringUtils;
+// Removed Transactional here, keep it on the Service implementation
 import org.springframework.web.bind.annotation.CrossOrigin;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
-import com.example.demo.dto.AuthResponse;
 import com.example.demo.dto.GoogleLoginRequest;
 import com.example.demo.model.User;
 import com.example.demo.service.GoogleAuthService;
 import com.example.demo.service.JwtTokenProvider;
 
+import jakarta.servlet.http.HttpServletResponse; // Needed for adding header directly (alternative)
+
 @RestController
 @RequestMapping("/api/auth")
-@CrossOrigin(origins = "http://localhost:3000")
+@CrossOrigin(origins = "http://localhost:3000", allowCredentials = "true") // Ensure allowCredentials = true
 public class AuthController {
 
- private static final Logger log = LoggerFactory.getLogger(AuthController.class);
+    private static final Logger log = LoggerFactory.getLogger(AuthController.class);
 
- // --- Inject Services ---
- private final GoogleAuthService googleAuthService; // Use the interface
- private final JwtTokenProvider jwtTokenProvider;
- // No longer need UserRepository here
+    private final GoogleAuthService googleAuthService;
+    private final JwtTokenProvider jwtTokenProvider;
 
- public AuthController(GoogleAuthService googleAuthService,
-                       JwtTokenProvider jwtTokenProvider) { // Remove UserRepository from constructor
-     this.googleAuthService = googleAuthService;
-     this.jwtTokenProvider = jwtTokenProvider;
- }
+    // Inject cookie properties
+    @Value("${app.jwt.cookie-name}")
+    private String jwtCookieName;
 
- // --- Simplified Method ---
- @PostMapping("/google")
- // Change @RequestBody type to expect the Access Token DTO
- public ResponseEntity<AuthResponse> authenticateGoogle(@RequestBody GoogleLoginRequest requestBody) {
-     // Extract the Access Token
-     String accessToken = requestBody.getAccessToken();
-     log.info("AuthController received /google request with Access Token: {}", (StringUtils.hasText(accessToken) ? "present" : "null or empty"));
+    @Value("${app.jwt.cookie-max-age-seconds}")
+    private long jwtCookieMaxAgeSeconds;
 
-     // Validate the received access token string
-     if (!StringUtils.hasText(accessToken)) {
-          log.warn("Received null or blank Access Token in /google request body.");
-          // Consider returning a structured error response instead of null
-          return ResponseEntity.badRequest().build();
-     }
+    // Constructor
+    public AuthController(GoogleAuthService googleAuthService,
+                          JwtTokenProvider jwtTokenProvider) {
+        this.googleAuthService = googleAuthService;
+        this.jwtTokenProvider = jwtTokenProvider;
+    }
 
-     try {
-         // --- CRITICAL BACKEND CHANGE NEEDED ---
-         // Step 1: Call the service method, passing the ACCESS TOKEN.
-         // The service method 'verifyAndProcessGoogleUser' (or a renamed version)
-         // MUST NOW handle this Access Token:
-         //   1. Verify the Access Token with Google (e.g., call tokeninfo/userinfo endpoint).
-         //   2. Extract user info (Google ID, email, name etc.) from the verification response.
-         //   3. Use the SAME Access Token to call Google People API for birthday.
-         //   4. Perform the "Find or Create" logic in your DB (DynamoDB).
-         //   5. Return the persistent User object.
-         User user = googleAuthService.verifyAndProcessGoogleUser(accessToken); // Pass Access Token
+    
+    // --- Modified /google Endpoint ---
+    @PostMapping("/google")
+    // Return only User now, token is in cookie
+    public ResponseEntity<User> authenticateGoogle(@RequestBody GoogleLoginRequest requestBody, HttpServletResponse httpServletResponse) {
+        String accessToken = requestBody.getAccessToken();
+        log.info("AuthController: /google request with Access Token: {}", (StringUtils.hasText(accessToken) ? "present" : "null or empty"));
 
-         // If service call succeeds and returns the User object from your DB...
+        if (!StringUtils.hasText(accessToken)) {
+             return ResponseEntity.badRequest().build();
+        }
 
-         // Step 2: Generate Your Application's JWT (remains the same logic)
-         String jwt = jwtTokenProvider.generateToken(user);
-         log.info("Generated JWT for processed user ID: {}, Email: {}", user.getUserId(), user.getEmail());
+        try {
+            // Step 1: Verify Google Token & process user in DB (via Service)
+            User user = googleAuthService.verifyAndProcessGoogleUser(accessToken);
 
-         // Step 3: Create Response Body (remains the same logic)
-         AuthResponse authResponse = new AuthResponse(jwt, user);
+            // Step 2: Generate Your Application's JWT
+            String jwt = jwtTokenProvider.generateToken(user);
 
-         // Step 4: Return OK response (remains the same logic)
-         return ResponseEntity.ok(authResponse);
+            // Step 3: Create HttpOnly Cookie
+            ResponseCookie cookie = ResponseCookie.from(jwtCookieName, jwt)
+                    .httpOnly(true)       // Essential: Prevents JS access
+                    .secure(true)         // Essential: Send only over HTTPS (Requires HTTPS setup)
+                                          // Set secure(false) ONLY for local HTTP testing if needed, NEVER in prod
+                    .path("/")            // Cookie accessible for all paths
+                    .maxAge(Duration.ofSeconds(jwtCookieMaxAgeSeconds)) // Set expiration
+                    .sameSite("Lax")      // Good default CSRF mitigation (use "Strict" if applicable)
+                    // .domain("yourdomain.com") // Set if needed for subdomains
+                    .build();
 
-     // --- Adjust Exception Handling if Service throws different types ---
-     } catch (IllegalArgumentException | GeneralSecurityException | IOException e) {
-         // These exceptions might still be relevant if thrown by the underlying Google client libraries
-         // or your verification logic for the access token. IllegalArgumentException is good for bad tokens.
-         log.error("Authentication failed during Google Access Token processing: {}", e.getMessage());
-         return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
-     } catch (Exception e) {
-          // Catch broader unexpected exceptions (e.g., database, People API call failures)
-          log.error("Unexpected internal error during Google authentication via Access Token: {}", e.getMessage(), e);
-          return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
-     }
- }
- 
+            // Step 4: Add Cookie to Response Header
+            httpServletResponse.addHeader(HttpHeaders.SET_COOKIE, cookie.toString());
+            log.info("AuthController: Set HttpOnly cookie '{}' for user ID: {}", jwtCookieName, user.getUserId());
+
+            // Step 5: Return User data in response body (Frontend needs this)
+            return ResponseEntity.ok(user);
+
+        } catch (IllegalArgumentException | GeneralSecurityException | IOException e) {
+            log.error("Authentication failed: {}", e.getMessage());
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        } catch (Exception e) {
+             log.error("Internal error during authentication: {}", e.getMessage(), e);
+             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+        }
+    }
+
+    // --- NEW: Logout Endpoint ---
+    @PostMapping("/logout")
+    public ResponseEntity<?> logoutUser(HttpServletResponse httpServletResponse) {
+        log.info("AuthController: Processing /logout request");
+        // Create a cookie with the same name, empty value, and maxAge=0 to clear it
+        ResponseCookie deleteCookie = ResponseCookie.from(jwtCookieName, "")
+                .httpOnly(true)
+                .secure(true) // Must match original cookie settings
+                .path("/")
+                .maxAge(0)   // Expire immediately
+                .sameSite("Lax") // Must match original cookie settings
+                // .domain("yourdomain.com") // Must match original cookie settings if used
+                .build();
+        httpServletResponse.addHeader(HttpHeaders.SET_COOKIE, deleteCookie.toString());
+        log.info("AuthController: Cleared HttpOnly cookie '{}'", jwtCookieName);
+        return ResponseEntity.ok("Logout successful"); // Or ResponseEntity.noContent()
+    }
 }

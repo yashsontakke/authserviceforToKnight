@@ -11,41 +11,48 @@ import org.springframework.security.config.annotation.web.configuration.EnableWe
 import org.springframework.security.config.http.SessionCreationPolicy; // Import Policy
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter; // Import standard filter
+import org.springframework.security.web.csrf.CookieCsrfTokenRepository;
 import org.springframework.web.cors.CorsConfiguration;
 import org.springframework.web.cors.CorsConfigurationSource;
 import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
 
-import com.example.demo.security.JwtAuthenticationFilter;
+import com.example.demo.security.JwtCookieAuthenticationFilter;
 
 @Configuration
 @EnableWebSecurity
 public class SecurityConfig {
 
-    @Autowired // Inject your custom filter
-    private JwtAuthenticationFilter jwtAuthenticationFilter;
+	 @Autowired
+	    private JwtCookieAuthenticationFilter jwtCookieAuthenticationFilter;
 
-    @Bean
-    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
-        http
-            .cors(cors -> cors.configurationSource(corsConfigurationSource()))
-            .csrf(csrf -> csrf.disable()) // Disable CSRF (common for stateless JWT APIs)
-            // --- Configure Session Management to STATELESS ---
-            .sessionManagement(sess -> sess.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
-            .authorizeHttpRequests(auth -> auth
-                .requestMatchers("/api/auth/**" , "/h2-console/**" , "/favicon.ico").permitAll() // Allow login/auth endpoints
-                // REMOVE temporary permitAll for /api/users/createuser if you added it
-                // .requestMatchers("/api/users/createuser").permitAll() // <-- REMOVE THIS IF PRESENT
-                .anyRequest().authenticated() // All other requests require authentication
-            )
-            // --- Add your JWT filter BEFORE the standard UsernamePasswordAuthenticationFilter ---
-            .addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class);
+	    @Bean
+	     SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+	        http
+	            .cors(cors -> cors.configurationSource(corsConfigurationSource()))
+	            .csrf(csrf -> csrf
+	                    .csrfTokenRepository(CookieCsrfTokenRepository.withHttpOnlyFalse())
+	                    // --- ADD THIS LINE to ignore CSRF for auth paths ---
+	                    .ignoringRequestMatchers("/api/auth/**")
+	                    // ---------------------------------------------------
+	             )
+	            .sessionManagement(sess -> sess.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+	            .authorizeHttpRequests(auth -> auth
+	                .requestMatchers("/api/auth/**").permitAll()
+	                .anyRequest().authenticated()
+	            )
+	            .addFilterBefore(jwtCookieAuthenticationFilter, UsernamePasswordAuthenticationFilter.class);
+	            
+	            // If frameOptions was the ONLY thing inside .headers(), you might remove the .headers() call entirely
+	            // unless you plan to add other security headers soon. Leaving an empty headers block is also fine.
+	            // Example if removing entirely (only if nothing else was in headers):
+	            // .addFilterBefore(jwtCookieAuthenticationFilter, UsernamePasswordAuthenticationFilter.class); // End previous line with semicolon
 
-        return http.build();
-    }
+	        return http.build();
+	    }
 
     // Keep your CORS configuration bean
     @Bean
-    public CorsConfigurationSource corsConfigurationSource() {
+    CorsConfigurationSource corsConfigurationSource() {
         CorsConfiguration configuration = new CorsConfiguration();
         configuration.setAllowedOrigins(Arrays.asList("http://localhost:3000"));
         configuration.setAllowedMethods(Arrays.asList("GET", "POST", "PUT", "DELETE", "OPTIONS"));
