@@ -1,0 +1,83 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:latest
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+
+  kafka:
+    image: confluentinc/cp-kafka:latest
+    depends_on:
+      - zookeeper
+    ports:
+      - "29092:29092"  # Expose 29092 for external connections
+      - "9092:9092"    # Internal Docker network communication
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+  kafdrop:
+    image: obsidiandynamics/kafdrop:latest
+    depends_on:
+      - kafka
+    ports:
+      - "9000:9000"
+    environment:
+      KAFKA_BROKERCONNECT: kafka:9092
+      SERVER_SERVLET_CONTEXTPATH: "/"
+      
+      
+  redis-stack:
+    image: redis/redis-stack:latest
+    container_name: redis-stack
+    ports:
+      - "6379:6379"   # Redis default port
+      - "8001:8001"   # RedisInsight GUI port
+    volumes:
+      - redis-data:/data  # Persistent Redis storage
+    environment:
+      - REDIS_ARGS=--save 60 1 --loglevel warning  # Optional: persistence settings
+      
+  prometheus:
+    image: prom/prometheus:v2.44.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+
+  grafana:
+    image: grafana/grafana:9.5.2
+    container_name: grafana
+    ports:
+      - "3001:3000"
+    restart: unless-stopped
+    volumes:
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources
+      
+  localstack:
+    image: localstack/localstack:latest  # Use a specific version if needed (e.g., 3.2.0)
+    container_name: localstack
+    ports:
+      - "4566:4566"  # Main edge port for LocalStack services
+      - "4571:4571"  # Optional: specific service port (e.g., IAM or others)
+    environment:
+      - SERVICES=s3,dynamodb,ec2  # Enable only the services you need
+      - DEFAULT_REGION=us-east-1  # Default AWS region
+      - DATA_DIR=/var/localstack/data  # Move data dir outside /tmp to avoid conflicts
+      - DEBUG=1  # Enable debug logs to troubleshoot issues
+    volumes:
+      - localstack-data:/var/localstack/data  # Named volume for persistent data
+      - /var/run/docker.sock:/var/run/docker.sock  # Docker socket for container interaction
+   
+
+volumes:
+  redis-data:  # Named volume for Redis persistence
+  localstack-data:

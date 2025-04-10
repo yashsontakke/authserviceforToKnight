@@ -2,19 +2,27 @@ package com.example.demo.service;
 import java.io.IOException; // Keep relevant exceptions
 import java.security.GeneralSecurityException; // Keep relevant exceptions
 import java.time.LocalDate;
+import java.util.List;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.StringUtils;
 import org.springframework.web.reactive.function.client.WebClient; // Import WebClient
 import org.springframework.web.reactive.function.client.WebClientResponseException;
 
+import com.example.demo.dto.BirthdayResponse;
+import com.example.demo.dto.EmailAddressResponse;
+import com.example.demo.dto.GenderResponse;
+import com.example.demo.dto.NameResponse;
+import com.example.demo.dto.PeopleApiResponse;
+import com.example.demo.dto.PersonMetadata;
 import com.example.demo.model.User;
 import com.example.demo.repository.UserDynamoDbRepository;
 
 import reactor.core.publisher.Mono; // Import Mono
-
-import com.example.demo.dto.*;
 
 
 @Service
@@ -37,55 +45,66 @@ public class GoogleAuthServiceImpl implements GoogleAuthService {
 
 
  @Override
- // Method now accepts accessToken instead of idTokenString
+ @Transactional
  public User verifyAndProcessGoogleUser(String accessToken)
-         throws GeneralSecurityException, IOException, IllegalArgumentException {
+         throws GeneralSecurityException, IOException, IllegalArgumentException { // Consider refining exceptions
 
-     log.debug("Attempting to process Google Access Token...");
+     log.debug("Attempting to process Google Access Token via People API...");
 
-     // --- Step 1: Verify Access Token & Get User Info ---
-     GoogleUserInfo userInfo = getUserInfoFromGoogle(accessToken);
-     if (userInfo == null || userInfo.sub == null) {
-         throw new IllegalArgumentException("Failed to retrieve valid user info from Google using access token.");
+     // --- Step 1: Call Google People API for combined info ---
+     PeopleApiResponse person = getPersonFromGoogle(accessToken);
+     if (person == null) {
+          throw new IllegalArgumentException("Failed to retrieve valid person data from Google People API.");
      }
 
-     String googleId = userInfo.sub;
-     String email = userInfo.email;
-     String name = userInfo.name;
-     String pictureUrl = userInfo.picture;
-     log.info("Google Access Token validated via UserInfo for Google ID: {}, Email: {}", googleId, email);
+     // --- Step 2: Extract required information ---
+     String googleId = extractGoogleId(person);
+     String email = extractPrimaryField(person.getEmailAddresses(), e -> e.value);
+     String name = extractPrimaryField(person.getNames(), n -> n.displayName);
+     String pictureUrl = extractPrimaryPhotoUrl(person); // Use specific logic for default photo
+     String gender = extractPrimaryField(person.getGenders(), g -> g.formattedValue != null ? g.formattedValue : g.value); // Prefer formatted value
+     LocalDate dob = extractBirthday(person);
 
-     // --- Step 2: Get Birthday info using the same Access Token ---
-     LocalDate dob = getBirthdayFromGoogle(accessToken); // Can return null if not found/permitted
+     if (googleId == null) {
+         throw new IllegalArgumentException("Could not determine Google ID (sub) from People API response.");
+     }
+     log.info("People API data processed for Google ID: {}, Email: {}, Name: {}, Gender: {}, DOB: {}",
+              googleId, email, name, gender, dob);
 
      // --- Step 3: Find or Create user in local DB ---
+     final String finalEmail = email; // Need final variable for lambda
+     final String finalName = name;
+     final String finalPictureUrl = pictureUrl;
+     final String finalGender = gender;
+     final LocalDate finalDob = dob;
+
      User user = userDynamoDbRepository.findByGoogleId(googleId)
              .map(existingUser -> {
-                 log.info("Existing user found with Google ID: {}. Updating details.", googleId);
+                 // User exists - update if necessary
+                 log.info("Existing user found (ID: {}). Updating details if changed.", existingUser.getUserId());
                  boolean updated = false;
-                 // Update fields based on fresh data from Google
-                 if (name != null && !name.equals(existingUser.getName())) {
-                     existingUser.setName(name); updated = true;
-                 }
-                 if (pictureUrl != null && !pictureUrl.equals(existingUser.getProfileImagePath())) {
-                      existingUser.setProfileImagePath(pictureUrl); updated = true;
-                 }
-                 if (email != null && !email.equals(existingUser.getEmail())) {
-                      log.warn("User email changed in Google profile for Google ID {}. Updating locally.", googleId);
-                      existingUser.setEmail(email); updated = true;
-                 }
-                 if (dob != null && !dob.equals(existingUser.getDateOfBirthAsLocalDate())) {
-                      log.info("Updating DOB for user {}", googleId);
-                      existingUser.setDateOfBirthAsLocalDate(dob); updated = true;
-                 } else if (dob == null && existingUser.getDateOfBirthAsLocalDate() != null) {
-                      // Handle case where birthday was previously set but now removed/hidden in Google
-                      log.info("Clearing DOB for user {} as it's no longer available from Google.", googleId);
-                      existingUser.setDateOfBirthAsLocalDate(null); updated = true;
-                 }
+                 if (finalName != null && !finalName.equals(existingUser.getName())) { existingUser.setName(finalName); updated = true; }
+                 if (finalEmail != null && !finalEmail.equals(existingUser.getEmail())) { /* careful */ existingUser.setEmail(finalEmail); updated = true; }
+                
+                 if (pictureUrl != null && !StringUtils.hasText(existingUser.getProfileImagePath())) {
+                	 log.info("Existing image path found : ",existingUser.getProfileImagePath());
+                     log.debug("Setting initial profile image path for user {} from Google (local path was empty)", existingUser.getUserId());
+                     existingUser.setProfileImagePath(pictureUrl); // Use Google pic only if no custom one
+                     updated = true;
+                } else {
+                     log.info("Preserving existing profileImagePath for user {} (likely custom S3 image or existing Google image)", existingUser.getUserId());
+                     // Do nothing, keep the existing path (which could be S3 key/URL or old Google URL)
+                }
+                 
+//                 if (finalPictureUrl != null && !finalPictureUrl.equals(existingUser.getProfileImagePath())) { existingUser.setProfileImagePath(finalPictureUrl); updated = true; }
+                 if (finalGender != null && !finalGender.equals(existingUser.getGender())) { existingUser.setGender(finalGender); updated = true; }
+                 // Compare LocalDate objects
+                 if (finalDob != null && !finalDob.equals(existingUser.getDateOfBirthAsLocalDate())) { existingUser.setDateOfBirthAsLocalDate(finalDob); updated = true; }
+                 else if (finalDob == null && existingUser.getDateOfBirthAsLocalDate() != null) { existingUser.setDateOfBirthAsLocalDate(null); updated = true; } // Handle removed DOB
 
                  if (updated) {
                      log.debug("Saving updated user details for Google ID: {}", googleId);
-                     userDynamoDbRepository.save(existingUser); // Save if updated
+                     userDynamoDbRepository.save(existingUser);
                  }
                  return existingUser;
              })
@@ -95,105 +114,115 @@ public class GoogleAuthServiceImpl implements GoogleAuthService {
                  User newUser = new User();
                  newUser.generateId(); // Generate internal UUID userId
                  newUser.setGoogleId(googleId);
-                 newUser.setEmail(email); // Assume email is required for new users
-                 newUser.setName(name);
-                 newUser.setProfileImagePath(pictureUrl);
-                 newUser.setEnabled(true); // Enable by default
-                 
-                 if (dob != null) {
-                	 System.out.print(dob);
-                      newUser.setDateOfBirthAsLocalDate(dob);
-                 }
+                 newUser.setEmail(finalEmail);
+                 newUser.setName(finalName);
+                 newUser.setProfileImagePath(finalPictureUrl);
+                 newUser.setGender(finalGender);
+                 newUser.setDateOfBirthAsLocalDate(finalDob);
+                 newUser.setEnabled(true);
                  log.debug("Saving new user with Google ID: {}", googleId);
-                 userDynamoDbRepository.save(newUser); // Save the new user
+                 userDynamoDbRepository.save(newUser);
                  return newUser;
              });
 
      log.info("Returning processed user with internal ID: {}, Email: {}", user.getUserId(), user.getEmail());
-     return user; // Return the persistent User entity from your DB
+     return user;
  }
-
-
- // --- Helper to call Google UserInfo endpoint ---
- private GoogleUserInfo getUserInfoFromGoogle(String accessToken) {
-     String userInfoUrl = "https://www.googleapis.com/oauth2/v3/userinfo";
-     log.debug("Calling Google UserInfo endpoint...");
+ 
+//--- Helper to call People API (request multiple fields) ---
+ private PeopleApiResponse getPersonFromGoogle(String accessToken) {
+     // Request multiple fields in one call
+     String personFields = "names,emailAddresses,photos,birthdays,genders,metadata"; // Added metadata for primary/source checks
+     String peopleApiUrl = "https://people.googleapis.com/v1/people/me?personFields=" + personFields;
+     log.debug("Calling Google People API endpoint: {}", peopleApiUrl);
      try {
          return webClient.get()
-                 .uri(userInfoUrl)
+                 .uri(peopleApiUrl)
                  .header("Authorization", "Bearer " + accessToken)
                  .retrieve()
-                 // Handle specific HTTP errors from Google
-                 .onStatus(status -> status.is4xxClientError() || status.is5xxServerError(),
+                 .onStatus(status -> status.isError(), // Handle 4xx/5xx errors
                            clientResponse -> clientResponse.bodyToMono(String.class)
                                .flatMap(body -> {
-                                   log.error("Google UserInfo Error - Status: {}, Body: {}", clientResponse.statusCode(), body);
-                                   // Map to a specific exception indicating token is likely invalid
-                                   return Mono.error(new IllegalArgumentException("Invalid Access Token or API error contacting Google UserInfo. Status: " + clientResponse.statusCode()));
+                                   log.error("Google People API Error - Status: {}, Body: {}", clientResponse.statusCode(), body);
+                                   // Check for 403 specifically, might mean insufficient scope granted by user
+                                   if(clientResponse.statusCode() == HttpStatus.FORBIDDEN) {
+                                        return Mono.error(new GeneralSecurityException("Permission denied by user or insufficient API scopes for People API. Status: 403"));
+                                   }
+                                   return Mono.error(new IOException("Error accessing Google People API. Status: " + clientResponse.statusCode()));
                                }))
-                 .bodyToMono(GoogleUserInfo.class)
-                 .block(); // Use block() for synchronous execution in this service method context
-     } catch (WebClientResponseException e) {
-          // Catch specific webclient errors if needed, but onStatus handles most HTTP errors
-          log.error("WebClient error calling Google UserInfo: {} - {}", e.getStatusCode(), e.getResponseBodyAsString(), e);
-          throw new IllegalArgumentException("Failed to verify access token with Google UserInfo: " + e.getMessage(), e);
+                 .bodyToMono(PeopleApiResponse.class)
+                 .block(); // Synchronous call
      } catch (Exception e) {
-          log.error("Unexpected error calling Google UserInfo endpoint", e);
-          throw new RuntimeException("Could not retrieve user info from Google: " + e.getMessage(), e);
+          log.error("Failed to call or parse Google People API response", e);
+          // Throw a meaningful exception
+          throw new RuntimeException("Could not retrieve required person data from Google: " + e.getMessage(), e);
      }
  }
 
+ // --- Helper methods to safely extract primary/best values ---
 
- // --- Helper to call Google People API for Birthday ---
- private LocalDate getBirthdayFromGoogle(String accessToken) {
-     String peopleApiUrl = "https://people.googleapis.com/v1/people/me?personFields=birthdays";
-     log.debug("Calling Google People API endpoint for birthdays...");
-     try {
-        PeopleApiResponse response = webClient.get()
-             .uri(peopleApiUrl)
-             .header("Authorization", "Bearer " + accessToken)
-             .retrieve()
-              // Handle specific errors
-             .onStatus(status -> status.is4xxClientError() || status.is5xxServerError(),
-                       clientResponse -> clientResponse.bodyToMono(String.class)
-                           .flatMap(body -> {
-                               // 403 might mean user didn't grant birthday scope or API not enabled
-                               log.error("Google People API Error - Status: {}, Body: {}", clientResponse.statusCode(), body);
-                               // Don't throw fatal error, just return Mono.empty() or Mono.error with specific type
-                               // Returning Mono.empty() will result in null response body downstream
-                               // Don't throw IllegalArgumentException here, as token might be valid but scope denied
-                               return Mono.error(new IOException("Failed to retrieve birthday from Google People API. Status: " + clientResponse.statusCode()));
+ private String extractGoogleId(PeopleApiResponse person) {
+      // Google ID ('sub') is often in metadata.source.id where source.type == 'ACCOUNT'
+      // Check primary email first, then primary name
+      if (person.getEmailAddresses() != null) {
+         for (EmailAddressResponse email : person.getEmailAddresses()) {
+              if (email.getMetadata() != null && Boolean.TRUE.equals(email.getMetadata().getPrimary())
+                      && email.getMetadata().getSource() != null && "ACCOUNT".equals(email.getMetadata().getSource().getType())) {
+                  return email.getMetadata().getSource().getId();
+              }
+          }
+      }
+      // Fallback to checking primary name metadata if not found in email
+      if (person.getNames() != null) {
+         for (NameResponse name : person.getNames()) {
+              if (name.getMetadata() != null && Boolean.TRUE.equals(name.getMetadata().getPrimary())
+                      && name.getMetadata().getSource() != null && "ACCOUNT".equals(name.getMetadata().getSource().getType())) {
+                  return name.getMetadata().getSource().getId();
+              }
+          }
+      }
+      log.error("Could not extract primary ACCOUNT source ID (googleId/sub) from People API response.");
+      return null; // Or throw?
+  }
 
-                           }))
-             .bodyToMono(PeopleApiResponse.class)
-             .block(); // Synchronous call
+ // Generic helper to find primary field value from a list
+ private <T> String extractPrimaryField(List<T> list, java.util.function.Function<T, String> valueExtractor) {
+      if (list == null || list.isEmpty()) return null;
+      return list.stream()
+          // Assuming list items have a getMetadata() method returning PersonMetadata
+          .filter(item -> {
+              try {
+                  PersonMetadata meta = (PersonMetadata) item.getClass().getMethod("getMetadata").invoke(item);
+                  return meta != null && Boolean.TRUE.equals(meta.getPrimary());
+              } catch (Exception e) { return false; } // Handle reflection exceptions/missing method
+          })
+          .map(valueExtractor)
+          .findFirst()
+           // Fallback to first item if no primary is marked (or reflection failed)
+          .orElseGet(() -> {
+              try { return valueExtractor.apply(list.get(0)); }
+              catch (Exception e) { return null; }
+          });
+  }
 
-        if (response != null && response.birthdays != null && !response.birthdays.isEmpty()) {
-             BirthdayResponse birthdayInfo = response.birthdays.get(0); // Get the primary birthday
-             if (birthdayInfo.date != null) {
-                 LocalDate dob = birthdayInfo.date.toLocalDate();
-                 if(dob != null) {
-                      log.info("Birthday data found and parsed: {}", dob);
-                      return dob;
-                 } else {
-                      log.warn("Birthday data found but components were invalid: Year={}, Month={}, Day={}",
-                                birthdayInfo.date.year, birthdayInfo.date.month, birthdayInfo.date.day);
-                 }
-             } else {
-                 log.info("Birthday field present in People API response but 'date' component is null.");
-             }
-        }
-        log.info("No valid/complete birthday information found or accessible in People API response.");
-        return null; // No birthday found, no permission, or incomplete data
+  private String extractPrimaryPhotoUrl(PeopleApiResponse person) {
+      if (person.getPhotos() == null || person.getPhotos().isEmpty()) return null;
+      return person.getPhotos().stream()
+          .filter(p -> p.getMetadata() != null && Boolean.TRUE.equals(p.getIsDefault())) // Use getIsDefault()
+          .map(p -> p.getUrl())
+          .findFirst()
+          .orElse(person.getPhotos().get(0).getUrl()); // Fallback to first photo
+  }
 
-     } catch (WebClientResponseException e) {
-         log.error("WebClient error calling Google People API: {} - {}", e.getStatusCode(), e.getResponseBodyAsString(), e);
-         // Don't fail the whole login just because birthday fetch failed. Log and return null.
-         return null;
-     } catch (Exception e) {
-         log.error("Unexpected error calling Google People API endpoint", e);
-         // Don't fail the whole login. Log and return null.
-         return null;
-     }
- }
+ 
+   private LocalDate extractBirthday(PeopleApiResponse person) {
+      if (person.getBirthdays() == null || person.getBirthdays().isEmpty()) return null;
+       return person.getBirthdays().stream()
+                 .filter(b -> b.getDate() != null && b.getMetadata() != null && b.getMetadata().getSource() != null && "PROFILE".equals(b.getMetadata().getSource().getType())) // Look for PROFILE source
+                 .map(b -> b.getDate().toLocalDate())
+                 .filter(java.util.Objects::nonNull) // Filter out nulls from failed conversions
+                 .findFirst()
+                 .orElseGet(() -> person.getBirthdays().get(0).getDate() != null ? person.getBirthdays().get(0).getDate().toLocalDate() : null); // Fallback
+  }
+
 }

@@ -1,9 +1,9 @@
 package com.example.demo.controller;
 
+import java.util.List;
+import java.util.Set;
 
-
-
-import org.slf4j.Logger; // Using SLF4J for logging (recommended)
+import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
@@ -11,90 +11,159 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.CrossOrigin;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PatchMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RequestPart;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
+
+import com.example.demo.dto.UpdateProfileRequest;
 import com.example.demo.model.User;
 import com.example.demo.security.UserPrincipal;
+import com.example.demo.service.UserService;
+
+import jakarta.servlet.http.HttpServletRequest;
+import software.amazon.awssdk.services.dynamodb.model.ResourceNotFoundException;
 
 @RestController
-@RequestMapping("/api/users") // Base path for user-related endpoints
-@CrossOrigin(origins = "http://localhost:3000") // Keep CORS configuration
+@RequestMapping("/api/users")
+@CrossOrigin(origins = "http://localhost:3000", allowCredentials = "true") // Keep CORS
 public class UserController {
 
-    // Initialize a logger for this class
     private static final Logger log = LoggerFactory.getLogger(UserController.class);
 
-    /**
-     * Simplified endpoint to receive and log user profile data including an optional image.
-     * --- THIS IS FOR TESTING/LOGGING ONLY ---
-     * Lacks authentication, validation, file storage, and database interaction.
-     */
-    @PostMapping(value = "/createuser", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public ResponseEntity<String> receiveAndLogUserProfileData(
-            @RequestParam("name") String name,
-            @RequestParam("dateOfBirth") String dateOfBirth, // Received as String for now
-            @RequestParam("gender") String gender,
-            @RequestParam("bio") String bio,
-            // Make image optional by setting required = false
-            @RequestParam(value = "image", required = false) MultipartFile image) {
+    private final UserService userService;
+    // Remove FileStorageService injection if only UserService calls it
 
-        // --- Logging the received data ---
-        log.info("--- Received request on /api/users/createuser ---");
-        log.info("Name           : {}", name);
-        log.info("Date of Birth  : {}", dateOfBirth); // Logged as raw string
-        log.info("Gender         : {}", gender);
-        log.info("Bio            : {}", bio);
+    public UserController(UserService userService) {
+        this.userService = userService;
+    }
 
-        // Log basic info about the uploaded file, if present
-        if (image != null && !image.isEmpty()) {
-            log.info("Image File     : Received");
-            log.info("  Original Name: {}", image.getOriginalFilename());
-            log.info("  Content Type : {}", image.getContentType());
-            log.info("  Size (bytes) : {}", image.getSize());
-        } else {
-            log.info("Image File     : Not provided or empty.");
+//    @SuppressWarnings("unused")
+	@GetMapping("/nearby")
+    public ResponseEntity<Set<User>> getNearbyUsersForAuthenticatedUser(@AuthenticationPrincipal UserPrincipal currentUser) {
+    	 String userId = currentUser.getUser().getUserId(); 
+
+
+      	
+
+        Set<User> nearbyUsers = userService.getNearbyUsers(userId);
+
+        if (nearbyUsers.isEmpty()) {
+            return ResponseEntity.noContent().build();
         }
-        log.info("--------------------------------------------------");
 
-        // --- Temporary Success Response ---
-        // Send a simple response indicating data was received.
-        // Replace this with meaningful response later (e.g., updated User object or status).
-        String message = String.format("Received data for user '%s'. Image provided: %b",
-                                       name, (image != null && !image.isEmpty()));
-        return ResponseEntity.ok(message);
+        return ResponseEntity.ok(nearbyUsers);
     }
     
+    @PostMapping("/like/{likedUserId}")
+    public ResponseEntity<String> likeUser(@PathVariable String likedUserId, @AuthenticationPrincipal UserPrincipal currentUser) {
+    	 String userId = currentUser.getId(); 
+
+        String response = userService.handleLike(userId, likedUserId);
+        return ResponseEntity.ok(response);
+    }
+    
+    @GetMapping("/matches")
+    public ResponseEntity<List<String>> getMatches(@AuthenticationPrincipal UserPrincipal currentUser) {
+    	 String userId = currentUser.getId(); 
+        List<String> activeMatches = userService.getActiveMatches(userId);
+        return ResponseEntity.ok(activeMatches);
+    }
+
+	 
+
     @GetMapping("/me")
     public ResponseEntity<User> getCurrentUserProfile(
-            // Inject the UserPrincipal object representing the authenticated user.
-            // This is populated by JwtAuthenticationFilter via UserDetailsService.
-            @AuthenticationPrincipal UserPrincipal currentUser) {
+            @AuthenticationPrincipal UserPrincipal currentUser,
+            HttpServletRequest request // <-- Inject HttpServletRequest
+            ) {
 
+        // --- Add this block to ensure CSRF token generation/loading ---
+        // Accessing the token attribute often triggers CookieCsrfTokenRepository
+        // to load/generate the token and make it available for the response cookie.
+        // "_csrf" is the default attribute name where Spring Security stores the token.
+//        CsrfToken csrfToken = (CsrfToken) request.getAttribute(CsrfToken.class.getName());
+        // Alternative using default name:
+        // CsrfToken csrfToken = (CsrfToken) request.getAttribute("_csrf");
+
+//        if (csrfToken != null) {
+             // You don't strictly need to *do* anything with the token here,
+             // just accessing it is often enough. Logging is useful for debugging.
+//             log.debug("/me endpoint: CSRF Token [{}] = {}", csrfToken.getHeaderName(), csrfToken.getToken());
+//        } else {
+             // This might happen on the very first request before login, which is fine.
+             // But it *should* be non-null for authenticated requests if CSRF is configured correctly.
+//             log.warn("/me endpoint: Could not find CsrfToken in request attributes.");
+//        }
+        // -----------------------------------------------------------
+
+        // Proceed with existing logic
         if (currentUser == null) {
-            // This case should ideally be prevented by Spring Security's filter chain
-            // if the endpoint is correctly configured as authenticated.
-            log.warn("Access attempt to /api/users/me without authenticated principal.");
-            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build(); // 401 Unauthorized
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
         }
-
-        // Assuming your UserPrincipal class has a way to access the underlying User entity
-        // (e.g., a getUser() method you added, or if UserPrincipal IS your User entity)
-        // If UserPrincipal *is* the User entity (and User implements UserDetails), you could cast:
-        // User user = (User) currentUser;
-        // If UserPrincipal *wraps* the User entity (more common):
-        User user = currentUser.getUser(); // Assuming you added a getUser() method to UserPrincipal
+        User user = currentUser.getUser(); // Assuming UserPrincipal has getUser()
         log.info("Fetching profile for authenticated user ID: {}", user.getUserId());
-        // Return the User object.
-        // Consider using a DTO (Data Transfer Object) pattern here if you want to
-        // exclude sensitive fields (like password hash if it existed) or format data differently.
-        // For now, returning the User entity directly is okay for profile info.
         return ResponseEntity.ok(user);
     }
 
-    // You will add back the proper implementation with authentication,
-    // service calls, file saving, and error handling here later.
+//    @GetMapping("/me")
+//    public ResponseEntity<User> getCurrentUserProfile(
+//            @AuthenticationPrincipal UserPrincipal currentUser,
+//            CsrfToken csrfToken // 👈 this forces CSRF token generation
+//    ) {
+//        if (currentUser == null) {
+//            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+//        }
+//
+//        User user = currentUser.getUser();
+//        log.info("Fetching profile for user ID: {}", user.getUserId());
+//
+//        // Optional: log the token just for debugging
+//        log.debug("CSRF token generated: {}", csrfToken.getToken());
+//
+//        return ResponseEntity.ok(user);
+//    }
 
+    // --- Updated Profile Update Endpoint ---
+    @PatchMapping(value = "/me/profile", consumes = { MediaType.MULTIPART_FORM_DATA_VALUE })
+    public ResponseEntity<?> updateUserProfile(
+            @AuthenticationPrincipal UserPrincipal currentUser,
+            // Use @RequestPart which works well for multipart/form-data
+            @RequestPart(value = "bio", required = false) String bio, // Bio might be optional
+            @RequestPart(value = "imageFile", required = false) MultipartFile imageFile // Image is optional
+    ) {
+        if (currentUser == null) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Authentication required.");
+        }
+        String userId = currentUser.getId(); 
+            
+         // If your UserPrincipal directly holds the String UUID:
+         // String userId = currentUser.getIdAsString(); // Example
+
+
+        log.info("Received profile update request for user ID: {}", userId);
+
+        try {
+            // Create the request DTO
+            UpdateProfileRequest updateRequest = new UpdateProfileRequest();
+            updateRequest.setBio(bio); // Will be null if not sent
+            updateRequest.setImageFile(imageFile); // Will be null if not sent
+
+            // Call the service to handle the update logic
+            User updatedUser = userService.updateUserProfile(userId, updateRequest);
+
+            // Return appropriate response DTO based on updatedUser
+            return ResponseEntity.ok(updatedUser); // Or a simpler success message/DTO
+
+        } catch (ResourceNotFoundException e) {
+            log.warn("User not found during profile update for ID: {}", userId);
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(e.getMessage());
+        } catch (Exception e) {
+            log.error("Failed to update profile for user: {}", userId, e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("Profile update failed.");
+        }
+    }
 }

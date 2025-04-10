@@ -7,6 +7,7 @@ public class GoogleUserInfo {
     public String sub; // This is the unique Google ID
     public String email;
     public Boolean email_verified;
+    public String gender;
     public String name;
     public String picture;
     public String given_name;
